@@ -6,105 +6,98 @@ import joblib
 import pymongo
 import os
 from datetime import datetime, timedelta
-# 用來處理密碼裡的特殊符號
-from urllib.parse import quote_plus 
+from urllib.parse import quote_plus
 
-# ==========================================
-# 1. 基礎設定 (遠端連線 + 帳號密碼)
-# ==========================================
 app = Flask(__name__)
+# 允許所有網域連線 (包含 Vercel)
 CORS(app)
 
-# ⚠️ 你的實驗室帳號密碼 (已填入)
-MONGO_USER = "wkdl"
-MONGO_PASS = "ugwUzXgeMBPjhNK"
+# ==========================================
+# 1. 基礎設定 (改為讀取環境變數，保護密碼)
+# ==========================================
+# 如果在本地跑，沒有設定環境變數，會使用後面的預設值(你可以暫時填你的，但不要上傳GitHub)
+MONGO_USER = os.getenv("MONGO_USER", "wkdl") 
+MONGO_PASS = os.getenv("MONGO_PASS", "ugwUzXgeMBPjhNK") # ⚠️ 注意：上傳 GitHub 前建議把這裡的預設密碼刪掉，改成 None
 
-# 自動處理特殊符號 (防止密碼裡的特殊字元搞壞連線)
 username = quote_plus(MONGO_USER)
 password = quote_plus(MONGO_PASS)
 
-# 遠端伺服器設定
 HOST = "140.116.96.197"
 PORT = "22122"
-DB_NAME = "IoT"               
-DEFAULT_COLLECTION = "m2m_kyle_new_1" # 根據你 Compass 看到的集合名稱
+DB_NAME = "IoT"
+DEFAULT_COLLECTION = "m2m_kyle_new_1"
 
-# 組合出正確的連線字串
 MONGO_URI = f"mongodb://{username}:{password}@{HOST}:{PORT}/{DB_NAME}?authSource=admin"
 
-print(f"🔗 正在嘗試連線到: mongodb://{HOST}:{PORT}/{DB_NAME} ...")
+print(f"🔗 正在嘗試連線到 MongoDB...")
 
 # ==========================================
 # 2. 載入訓練好的模型
 # ==========================================
-print("📂 正在載入 AI 模型...")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), 'models')
+
+# 加上全域變數初始值，避免當掉
+model_rf = None
+model_ridge = None
+scaler = None
 
 try:
     rf_path = os.path.join(MODEL_DIR, 'orchid_rf.pkl')
     ridge_path = os.path.join(MODEL_DIR, 'orchid_ridge.pkl')
     scaler_path = os.path.join(MODEL_DIR, 'orchid_scaler.pkl')
 
-    if not os.path.exists(rf_path):
-        raise FileNotFoundError(f"找不到模型檔案: {rf_path}")
+    if os.path.exists(rf_path):
+        model_rf = joblib.load(rf_path)
+        model_ridge = joblib.load(ridge_path)
+        scaler = joblib.load(scaler_path)
+        print("✅ 模型載入成功！")
+    else:
+        print(f"❌ 找不到模型檔案: {rf_path}")
 
-    model_rf = joblib.load(rf_path)
-    model_ridge = joblib.load(ridge_path)
-    scaler = joblib.load(scaler_path)
-    print("✅ 模型載入成功！")
 except Exception as e:
-    print(f"❌ 模型載入失敗: {e}")
-    model_rf = None
+    print(f"❌ 模型載入發生錯誤: {e}")
 
 # ==========================================
-# 3. 輔助函式：連線 MongoDB
+# 3. 輔助函式
 # ==========================================
 def get_mongo_collection(collection_name=None):
     if collection_name is None:
         collection_name = DEFAULT_COLLECTION
-    # 使用包含帳密的 URI 連線
-    client = pymongo.MongoClient(MONGO_URI)
+    client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000) # 設定 5秒逾時，避免卡死
     db = client[DB_NAME]
     return db[collection_name]
 
 # ==========================================
-# 4. API: 取得歷史數據 (與 route.ts 邏輯一致)
+# 4. API: 歷史數據
 # ==========================================
 @app.route('/api/history', methods=['GET'])
 def get_history():
     try:
-        # 允許前端透過參數指定要看哪個感測器 ?collection=m2m_kyle_new_6
         target_col = request.args.get('collection', DEFAULT_COLLECTION)
         col = get_mongo_collection(target_col)
         
+        # 測試連線 (Ping)
+        # col.database.command('ping') 
+
         projection = {
             '_id': 0, 
-            'timestamp': 1,     # route.ts 用 timestamp
-            'Time': 1,          # 有些舊資料可能用 Time
+            'timestamp': 1, 'Time': 1,
             'temperature': 1, 'Temp': 1,
-            'humidity': 1,    'Humid': 1,
-            'light': 1,       'Lux': 1,
-            'eco2': 1, 
-            'co2': 1
+            'humidity': 1, 'Humid': 1,
+            'light': 1, 'Lux': 1,
+            'eco2': 1, 'co2': 1
         }
         
-        # 抓最近 100 筆
         data = list(col.find({}, projection).sort("timestamp", -1).limit(100))
         
         formatted_data = []
         for d in data:
-            # 智慧欄位選取
             ts = d.get('timestamp') or d.get('Time')
             temp = d.get('temperature') if d.get('temperature') is not None else d.get('Temp')
             hum = d.get('humidity') if d.get('humidity') is not None else d.get('Humid')
             lux = d.get('light') if d.get('light') is not None else d.get('Lux')
             
-            # 處理 CO2
-            co2_val = d.get('eco2')
-            if co2_val is None:
-                co2_val = d.get('co2')
-            if co2_val is None:
-                co2_val = 400 
+            co2_val = d.get('eco2') or d.get('co2') or 400
 
             formatted_data.append({
                 "timestamp": ts,
@@ -122,17 +115,15 @@ def get_history():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 5. API: AI 產量預測 (核心功能)
+# 5. API: 預測
 # ==========================================
 @app.route('/api/predict', methods=['GET'])
 def predict():
     if model_rf is None:
-        return jsonify({"status": "error", "message": "模型未載入"}), 500
+        return jsonify({"status": "error", "message": "模型未載入，請檢查伺服器日誌"}), 500
 
     try:
         col = get_mongo_collection(DEFAULT_COLLECTION)
-        
-        # 1. 抓取數據
         data = list(col.find({}, {'_id': 0}).sort("timestamp", -1).limit(5000))
         
         if not data:
@@ -140,13 +131,10 @@ def predict():
 
         df = pd.DataFrame(data)
         
-        # 2. 資料標準化
-        if 'timestamp' in df.columns:
-            df = df.rename(columns={'timestamp': 'Date'})
-        elif 'Time' in df.columns:
-            df = df.rename(columns={'Time': 'Date'})
+        # --- 資料處理邏輯 (保持你不變) ---
+        if 'timestamp' in df.columns: df = df.rename(columns={'timestamp': 'Date'})
+        elif 'Time' in df.columns: df = df.rename(columns={'Time': 'Date'})
             
-        # 欄位對應
         if 'temperature' in df.columns: df['T_Avg'] = df['temperature']
         elif 'Temp' in df.columns: df['T_Avg'] = df['Temp']
             
@@ -156,7 +144,6 @@ def predict():
         if 'light' in df.columns: df['Rsum'] = df['light']
         elif 'Lux' in df.columns: df['Rsum'] = df['Lux']
             
-        # CO2 處理
         if 'eco2' in df.columns:
             df['CO2'] = df['eco2']
             if 'co2' in df.columns:
@@ -166,16 +153,13 @@ def predict():
         else:
             df['CO2'] = 400
 
-        # 3. 清洗
         df['Date'] = pd.to_datetime(df['Date'])
         cols_to_clean = ['T_Avg', 'H_Avg', 'Rsum', 'CO2']
-        
         for c in cols_to_clean:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
                 df[c] = df[c].replace(-1, np.nan)
         
-        # 4. 聚合
         df.set_index('Date', inplace=True)
         df_daily = df.resample('D').mean(numeric_only=True).dropna()
         
@@ -184,9 +168,10 @@ def predict():
 
         today_row = df_daily.iloc[[-1]].copy()
         
-        # 5. 特徵準備
+        # 假定 Yield
         last_yield = 1000
-        yield_file = 'orchid_yield.csv'
+        # 這裡要注意，Render 上可能沒有 orchid_yield.csv，如果有上傳就沒問題
+        yield_file = os.path.join(os.path.dirname(__file__), 'orchid_yield.csv')
         if os.path.exists(yield_file):
             try:
                 df_yield = pd.read_csv(yield_file)
@@ -203,12 +188,10 @@ def predict():
                 
         X_input = today_row[features]
         
-        # 6. 預測
         pred_rf = model_rf.predict(X_input)[0]
         X_scaled = scaler.transform(X_input)
         pred_ridge = model_ridge.predict(X_scaled)[0]
         
-        # 7. 根因
         importances = model_rf.feature_importances_
         indices = np.argsort(importances)[::-1][:3]
         root_causes = []
@@ -233,5 +216,7 @@ def predict():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
-    print("🚀 Python AI 伺服器啟動 (Database: IoT / User: wkdl)")
-    app.run(port=5000, debug=True)
+    # ⚠️ Render 部署關鍵：host 必須是 0.0.0.0
+    port = int(os.environ.get('PORT', 5000))
+    print(f"🚀 Python AI Server starting on port {port}...")
+    app.run(host='0.0.0.0', port=port, debug=False)
