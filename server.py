@@ -81,6 +81,11 @@ def get_mongo_collection(collection_name=None):
 # ==========================================
 # 4. API: 歷史數據
 # ==========================================
+# ... 前面的 import 保持不變
+
+# ==========================================
+# 4. API: 歷史數據 (修改版：日平均)
+# ==========================================
 @app.route('/api/history', methods=['GET'])
 def get_history():
     try:
@@ -88,47 +93,72 @@ def get_history():
         target_col = request.args.get('collection', DEFAULT_COLLECTION)
         col = get_mongo_collection(target_col)
         
+        # 🔥 修改 1: 不要只抓 14 筆，改抓過去 15 天的所有數據來算平均
+        # 算出 15 天前的時間點
+        start_date = (datetime.utcnow() - timedelta(days=15)).isoformat()
+        
+        # 查詢條件：時間 >= 15 天前
+        query = {"timestamp": {"$gte": start_date}}
+        
         projection = {
             '_id': 0, 
             'timestamp': 1, 'Time': 1,
             'temperature': 1, 'Temp': 1,
-            'humidity': 1, 'Humid': 1,
-            'light': 1, 'Lux': 1,
-            'eco2': 1, 'co2': 1
+            'co2': 1, 'eco2': 1
         }
         
-        # 抓取最新的 14 筆數據 (搭配前端圖表需求)
-        data = list(col.find({}, projection).sort("timestamp", -1).limit(14))
+        # 抓取大量數據 (不設 limit)
+        data = list(col.find(query, projection).sort("timestamp", 1))
         
-        formatted_data = []
-        for d in data:
-            ts = d.get('timestamp') or d.get('Time')
-            temp = d.get('temperature') if d.get('temperature') is not None else d.get('Temp')
-            hum = d.get('humidity') if d.get('humidity') is not None else d.get('Humid')
-            lux = d.get('light') if d.get('light') is not None else d.get('Lux')
+        if not data:
+            return jsonify([])
             
-            # 同時支援 co2 與 eco2
-            co2_val = d.get('co2')
-            if co2_val is None:
-                co2_val = d.get('eco2')
-            if co2_val is None:
-                co2_val = 400
+        # 🔥 修改 2: 使用 Pandas 計算「每日平均」
+        df = pd.DataFrame(data)
+        
+        # 處理時間欄位
+        if 'timestamp' in df.columns: 
+            df['Date'] = pd.to_datetime(df['timestamp'])
+        elif 'Time' in df.columns: 
+            df['Date'] = pd.to_datetime(df['Time'])
+            
+        # 處理數值欄位 (轉成數字，避免錯誤)
+        cols_to_fix = ['temperature', 'Temp', 'co2', 'eco2']
+        for c in cols_to_fix:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
 
+        # 統一欄位名稱
+        if 'Temp' in df.columns: df['temperature'] = df['Temp']
+        
+        # 處理 CO2 (優先用 co2，沒有則用 eco2)
+        if 'co2' not in df.columns and 'eco2' in df.columns:
+            df['co2'] = df['eco2']
+        
+        # 設定日期為索引，準備重取樣
+        df.set_index('Date', inplace=True)
+        
+        # 👉 重點：按「天 (D)」進行平均 (Resample)
+        df_daily = df.resample('D').mean(numeric_only=True).dropna()
+        
+        # 取最後 14 天
+        df_final = df_daily.tail(14).reset_index()
+        
+        # 轉回 JSON 格式
+        formatted_data = []
+        for _, row in df_final.iterrows():
             formatted_data.append({
-                "timestamp": ts,
-                "temperature": temp,
-                "humidity": hum,
-                "light": lux,
-                "co2": co2_val
+                # 這裡的 timestamp 會是該日期的 00:00:00，剛好代表那一天
+                "timestamp": row['Date'].strftime('%Y-%m-%dT%H:%M:%S'),
+                "temperature": round(row.get('temperature', 0), 1),
+                "co2": round(row.get('co2', 400), 0)
             })
             
-        formatted_data.reverse() # 轉成 時間舊 -> 時間新
         return jsonify(formatted_data)
 
     except Exception as e:
         print(f"History API Error: {e}")
         return jsonify({"error": str(e)}), 500
-
 # ==========================================
 # 5. API: 預測
 # ==========================================
