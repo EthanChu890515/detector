@@ -13,23 +13,29 @@ app = Flask(__name__)
 CORS(app)
 
 # ==========================================
-# 1. 基礎設定 (改為讀取環境變數，保護密碼)
+# 1. 基礎設定
 # ==========================================
-# 如果在本地跑，沒有設定環境變數，會使用後面的預設值(你可以暫時填你的，但不要上傳GitHub)
-MONGO_USER = os.getenv("MONGO_USER", "wkdl") 
-MONGO_PASS = os.getenv("MONGO_PASS", "ugwUzXgeMBPjhNK") # ⚠️ 注意：上傳 GitHub 前建議把這裡的預設密碼刪掉，改成 None
+# ⚠️ 安全性修正：不要在這裡寫死密碼，Render 環境變數設定好即可
+MONGO_USER = os.getenv("MONGO_USER") 
+MONGO_PASS = os.getenv("MONGO_PASS") 
 
-username = quote_plus(MONGO_USER)
-password = quote_plus(MONGO_PASS)
+# 如果本地測試沒有環境變數，提醒使用者
+if not MONGO_USER or not MONGO_PASS:
+    print("⚠️ 警告: 未偵測到 MONGO_USER 或 MONGO_PASS 環境變數")
+
+username = quote_plus(MONGO_USER) if MONGO_USER else ""
+password = quote_plus(MONGO_PASS) if MONGO_PASS else ""
 
 HOST = "140.116.96.197"
 PORT = "22122"
 DB_NAME = "IoT"
-DEFAULT_COLLECTION = "m2m_kyle_new_1"
+
+# 🔥 修改點：將預設集合改成 "m2m_kyle_new_9" (實驗上)，確保讀到最新數據
+DEFAULT_COLLECTION = "m2m_kyle_new_9"
 
 MONGO_URI = f"mongodb://{username}:{password}@{HOST}:{PORT}/{DB_NAME}?authSource=admin"
 
-print(f"🔗 正在嘗試連線到 MongoDB...")
+print(f"🔗 正在嘗試連線到 MongoDB... 預設集合: {DEFAULT_COLLECTION}")
 
 # ==========================================
 # 2. 載入訓練好的模型
@@ -63,6 +69,11 @@ except Exception as e:
 def get_mongo_collection(collection_name=None):
     if collection_name is None:
         collection_name = DEFAULT_COLLECTION
+    
+    # 這裡加入錯誤處理，如果連線字串是空的就報錯
+    if not MONGO_URI.startswith("mongodb"):
+        raise ValueError("MongoDB URI 設定錯誤，請檢查環境變數")
+
     client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000) # 設定 5秒逾時，避免卡死
     db = client[DB_NAME]
     return db[collection_name]
@@ -73,12 +84,10 @@ def get_mongo_collection(collection_name=None):
 @app.route('/api/history', methods=['GET'])
 def get_history():
     try:
+        # 允許前端透過 ?collection=xxx 來指定要看哪一個感測器
         target_col = request.args.get('collection', DEFAULT_COLLECTION)
         col = get_mongo_collection(target_col)
         
-        # 測試連線 (Ping)
-        # col.database.command('ping') 
-
         projection = {
             '_id': 0, 
             'timestamp': 1, 'Time': 1,
@@ -88,7 +97,8 @@ def get_history():
             'eco2': 1, 'co2': 1
         }
         
-        data = list(col.find({}, projection).sort("timestamp", -1).limit(100))
+        # 抓取最新的 14 筆數據 (搭配前端圖表需求)
+        data = list(col.find({}, projection).sort("timestamp", -1).limit(14))
         
         formatted_data = []
         for d in data:
@@ -97,7 +107,12 @@ def get_history():
             hum = d.get('humidity') if d.get('humidity') is not None else d.get('Humid')
             lux = d.get('light') if d.get('light') is not None else d.get('Lux')
             
-            co2_val = d.get('eco2') or d.get('co2') or 400
+            # 同時支援 co2 與 eco2
+            co2_val = d.get('co2')
+            if co2_val is None:
+                co2_val = d.get('eco2')
+            if co2_val is None:
+                co2_val = 400
 
             formatted_data.append({
                 "timestamp": ts,
@@ -107,7 +122,7 @@ def get_history():
                 "co2": co2_val
             })
             
-        formatted_data.reverse()
+        formatted_data.reverse() # 轉成 時間舊 -> 時間新
         return jsonify(formatted_data)
 
     except Exception as e:
@@ -123,7 +138,10 @@ def predict():
         return jsonify({"status": "error", "message": "模型未載入，請檢查伺服器日誌"}), 500
 
     try:
+        # 使用預設集合 (m2m_kyle_new_9) 進行預測
         col = get_mongo_collection(DEFAULT_COLLECTION)
+        
+        # 抓取最近 5000 筆來確保有足夠數據做平均 (Resample)
         data = list(col.find({}, {'_id': 0}).sort("timestamp", -1).limit(5000))
         
         if not data:
@@ -131,7 +149,7 @@ def predict():
 
         df = pd.DataFrame(data)
         
-        # --- 資料處理邏輯 (保持你不變) ---
+        # --- 資料處理邏輯 ---
         if 'timestamp' in df.columns: df = df.rename(columns={'timestamp': 'Date'})
         elif 'Time' in df.columns: df = df.rename(columns={'Time': 'Date'})
             
@@ -144,12 +162,13 @@ def predict():
         if 'light' in df.columns: df['Rsum'] = df['light']
         elif 'Lux' in df.columns: df['Rsum'] = df['Lux']
             
-        if 'eco2' in df.columns:
-            df['CO2'] = df['eco2']
-            if 'co2' in df.columns:
-                df['CO2'] = df['CO2'].fillna(df['co2'])
-        elif 'co2' in df.columns:
+        # 融合 CO2
+        if 'co2' in df.columns:
             df['CO2'] = df['co2']
+            if 'eco2' in df.columns:
+                 df['CO2'] = df['CO2'].fillna(df['eco2'])
+        elif 'eco2' in df.columns:
+            df['CO2'] = df['eco2']
         else:
             df['CO2'] = 400
 
@@ -161,16 +180,17 @@ def predict():
                 df[c] = df[c].replace(-1, np.nan)
         
         df.set_index('Date', inplace=True)
+        # 按日平均
         df_daily = df.resample('D').mean(numeric_only=True).dropna()
         
         if df_daily.empty:
             return jsonify({"status": "error", "message": "有效數據不足"})
 
+        # 取最後一天 (通常就是今天)
         today_row = df_daily.iloc[[-1]].copy()
         
-        # 假定 Yield
+        # 假定 Yield (因為沒有即時產量輸入，先用固定值)
         last_yield = 1000
-        # 這裡要注意，Render 上可能沒有 orchid_yield.csv，如果有上傳就沒問題
         yield_file = os.path.join(os.path.dirname(__file__), 'orchid_yield.csv')
         if os.path.exists(yield_file):
             try:
@@ -192,6 +212,7 @@ def predict():
         X_scaled = scaler.transform(X_input)
         pred_ridge = model_ridge.predict(X_scaled)[0]
         
+        # 找出關鍵因子
         importances = model_rf.feature_importances_
         indices = np.argsort(importances)[::-1][:3]
         root_causes = []
@@ -202,8 +223,13 @@ def predict():
                 "impact": "關鍵因子"
             })
 
+        # 回傳預測結果 (加上 UTC+8 調整顯示日期)
+        # Render 伺服器是 UTC，我們加 8 小時讓它顯示台灣時間
+        tw_time = datetime.utcnow() + timedelta(hours=8)
+        predict_date = (tw_time + timedelta(days=1)).strftime('%Y-%m-%d')
+
         return jsonify({
-            "date": (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d'),
+            "date": predict_date,
             "rf_prediction": int(max(0, pred_rf)),
             "ridge_prediction": int(max(0, pred_ridge)),
             "status": "Warning" if pred_rf < 800 else "Normal",
@@ -216,7 +242,6 @@ def predict():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
-    # ⚠️ Render 部署關鍵：host 必須是 0.0.0.0
     port = int(os.environ.get('PORT', 5000))
     print(f"🚀 Python AI Server starting on port {port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
